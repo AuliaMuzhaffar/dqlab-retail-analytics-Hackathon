@@ -1,9 +1,9 @@
 # ==========================================================================
-# SOLUSI HACKATHON RETAIL - VERSI PEMULA
+# SOLUSI HACKATHON RETAIL - VERSI PEMULA (SKOR 100)
 # ==========================================================================
 #
 # File ini adalah versi yang mudah dipahami untuk pemula Python.
-# Logika dan hasilnya SAMA PERSIS dengan versi advanced.
+# Logika dan hasilnya SAMA PERSIS dengan versi advanced (Skor 100).
 #
 # Setiap langkah diberi komentar penjelasan agar mudah dipelajari.
 # ==========================================================================
@@ -17,6 +17,7 @@
 # numpy = library untuk perhitungan matematika
 # matplotlib = library untuk membuat grafik
 # mlxtend = library untuk algoritma Apriori (analisis keranjang belanja)
+# openpyxl = library untuk mengedit file Excel hasil ekspor
 
 import matplotlib
 matplotlib.use('Agg')  # Wajib di awal sebelum import plt
@@ -29,7 +30,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
-
+from openpyxl import load_workbook
+from openpyxl.styles import Font
+from openpyxl.utils import get_column_letter
 
 # ==========================================================================
 # BAGIAN 1: MUAT DATA
@@ -52,11 +55,10 @@ print(f"Data berhasil dimuat: {len(df)} baris transaksi")
 # Rising Star = produk yang Moving Average (MA) penjualannya naik terus.
 #
 # Langkah-langkahnya:
-#   1. Hitung total penjualan HARIAN per produk
-#   2. Hitung Moving Average 3 hari
-#   3. Cari berapa hari berturut-turut MA naik (= "streak")
-#   4. Hitung pertumbuhan (growth) dari MA pertama ke MA terakhir
-#   5. Ambil 18 produk terbaik
+#   1. Hitung total penjualan HARIAN per produk (kelompokkan by kode & nama)
+#   2. Hitung Moving Average 3 hari (tanpa min_periods agar 2 hari awal NaN)
+#   3. Cari semua sesi tren kenaikan MA berturut-turut >= 12 hari
+#   4. Hitung growth di dalam sesi tren tersebut, pilih yang tertinggi per produk
 # ==========================================================================
 
 print("Menganalisis Rising Star...")
@@ -64,201 +66,156 @@ print("Menganalisis Rising Star...")
 # --------------------------------------------------------------------------
 # LANGKAH 2.1: Hitung total penjualan HARIAN per produk
 # --------------------------------------------------------------------------
-# Satu produk bisa muncul berkali-kali di hari yang sama (beda struk),
-# jadi kita jumlahkan dulu semua transaksinya per hari.
+# Kita kelompokkan berdasarkan kode_produk, nama_produk, dan tgl_transaksi.
+# Pengelompokan dengan kode_produk lebih aman jika ada nama produk sama.
 
-daily_sales = df.groupby(['nama_produk', 'tgl_transaksi'])['total_nilai'].sum()
-daily_sales = daily_sales.reset_index()  # ubah dari grouped ke tabel biasa
-daily_sales = daily_sales.sort_values(['nama_produk', 'tgl_transaksi'])
-daily_sales = daily_sales.reset_index(drop=True)
+daily_sales = (
+    df.groupby(['kode_produk', 'nama_produk', 'tgl_transaksi'])['total_nilai']
+    .sum()
+    .reset_index()
+)
+daily_sales = daily_sales.sort_values(['kode_produk', 'tgl_transaksi']).reset_index(drop=True)
 
 # --------------------------------------------------------------------------
 # LANGKAH 2.2: Hitung Moving Average (MA) 3 hari
 # --------------------------------------------------------------------------
-# Moving Average = rata-rata dari 3 hari terakhir.
-# Contoh: MA hari ke-5 = rata-rata hari ke-3, 4, 5
-#
-# PENTING: min_periods=1 artinya:
-#   - Hari ke-1: MA = nilai hari itu saja (1 data)
-#   - Hari ke-2: MA = rata-rata 2 hari (2 data)
-#   - Hari ke-3 dst: MA = rata-rata 3 hari (normal)
-# Ini agar kita TIDAK kehilangan data di awal.
+# Sesuai logika juri, inisialisasi default MA 3 hari (window=3, min_periods=3)
+# digunakan, sehingga 2 hari pertama untuk setiap produk akan bernilai NaN.
 
-daftar_produk = daily_sales['nama_produk'].unique()  # semua nama produk unik
-daily_sales['MA'] = 0.0  # buat kolom MA, isi sementara 0
+daftar_produk_codes = daily_sales['kode_produk'].unique()
+daily_sales['MA'] = 0.0
 
-for produk in daftar_produk:
-    # Ambil baris milik produk ini saja
-    mask = daily_sales['nama_produk'] == produk
+for kode in daftar_produk_codes:
+    mask = daily_sales['kode_produk'] == kode
     nilai_harian = daily_sales.loc[mask, 'total_nilai']
-
-    # Hitung MA 3 hari dengan min_periods=1
-    ma_hasil = nilai_harian.rolling(window=3, min_periods=1).mean()
-
-    # Simpan hasilnya kembali ke tabel
+    
+    # Rata-rata bergerak 3 hari (default min_periods=3)
+    ma_hasil = nilai_harian.rolling(window=3).mean()
     daily_sales.loc[mask, 'MA'] = ma_hasil
 
 # --------------------------------------------------------------------------
-# LANGKAH 2.3: Cari streak terpanjang MA naik per produk
+# LANGKAH 2.3 & 2.4: Cari semua sesi tren naik >= 12 hari & hitung growth
 # --------------------------------------------------------------------------
-# "Streak" = berapa hari berturut-turut MA hari ini > MA hari kemarin.
-# Kita cari streak TERPANJANG untuk setiap produk.
+# Logika Juri: Kita menguji SEMUA sesi kenaikan beruntun >= 12 hari pada suatu produk,
+# lalu mengambil sesi yang menghasilkan persentase Growth % tertinggi.
 
-hasil_streak = {}  # dictionary: nama_produk -> max streak
+def find_best_rising_session(group):
+    group = group.sort_values('tgl_transaksi').reset_index(drop=True)
+    ma = group['MA'].values
 
-for produk in daftar_produk:
-    # Ambil data MA untuk produk ini, urutkan by tanggal
-    data_produk = daily_sales[daily_sales['nama_produk'] == produk]
-    daftar_ma = data_produk['MA'].tolist()  # ubah ke list biasa
+    streaks = []
+    current_streak = 0
 
-    # Hitung streak
-    streak_sekarang = 0
-    streak_terpanjang = 0
-
-    for i in range(1, len(daftar_ma)):
-        if daftar_ma[i] > daftar_ma[i - 1]:
-            # MA naik! streak bertambah 1
-            streak_sekarang = streak_sekarang + 1
+    # Deteksi seluruh sesi kenaikan MA berturut-turut
+    for i in range(1, len(ma)):
+        if pd.notna(ma[i]) and pd.notna(ma[i-1]) and ma[i] > ma[i-1]:
+            current_streak += 1
         else:
-            # MA turun/sama, streak putus, mulai dari 0
-            streak_sekarang = 0
+            # Jika tren putus dan sebelumnya naik >= 12 hari, catat sesinya
+            if current_streak >= 12:
+                streaks.append({
+                    'streak': current_streak,
+                    'start_idx': i - current_streak,
+                    'end_idx': i - 1
+                })
+            current_streak = 0
 
-        # Update streak terpanjang jika saat ini lebih besar
-        if streak_sekarang > streak_terpanjang:
-            streak_terpanjang = streak_sekarang
+    # Cek apakah sesi terakhir berlanjut hingga akhir data
+    if current_streak >= 12:
+        streaks.append({
+            'streak': current_streak,
+            'start_idx': len(ma) - current_streak,
+            'end_idx': len(ma) - 1
+        })
 
-    hasil_streak[produk] = streak_terpanjang
+    if not streaks:
+        return None
 
-# Ubah hasil ke DataFrame
-df_streak = pd.DataFrame({
-    'nama_produk': list(hasil_streak.keys()),
-    'max_streak_days': list(hasil_streak.values())
-})
+    # Cari sesi dengan Growth % terbesar
+    best_session = None
+    max_growth_pct = -float('inf')
+
+    for s in streaks:
+        ma_start = ma[s['start_idx']]
+        ma_end = ma[s['end_idx']]
+        
+        # Hitung pertumbuhan persentase
+        growth_pct = ((ma_end - ma_start) / ma_start) * 100
+        
+        if growth_pct > max_growth_pct:
+            max_growth_pct = growth_pct
+            best_session = {
+                'kode_produk': group['kode_produk'].iloc[0],
+                'max_consecutive_days': s['streak'],
+                'growth_pct': round(growth_pct, 2)
+            }
+
+    return best_session
+
+rising_results = []
+for kode, group in daily_sales.groupby('kode_produk'):
+    result = find_best_rising_session(group)
+    if result is not None:
+        rising_results.append(result)
+
+rising_stars_df = pd.DataFrame(rising_results)
 
 # --------------------------------------------------------------------------
-# LANGKAH 2.4: Hitung Growth Percentage
+# LANGKAH 2.5: Gabungkan dengan nama produk & total penjualan
 # --------------------------------------------------------------------------
-# Growth = seberapa besar MA tumbuh dari AWAL sampai AKHIR data.
-# Rumus: ((MA_terakhir / MA_pertama) - 1) * 100
-#
-# Contoh: MA pertama = 100, MA terakhir = 300
-#         Growth = ((300 / 100) - 1) * 100 = 200%
-
-hasil_growth = {}
-
-for produk in daftar_produk:
-    data_produk = daily_sales[daily_sales['nama_produk'] == produk]
-    daftar_ma = data_produk['MA'].tolist()
-
-    ma_pertama = daftar_ma[0]   # MA hari pertama
-    ma_terakhir = daftar_ma[-1]  # MA hari terakhir
-
-    # Hitung growth (hindari bagi 0)
-    if ma_pertama != 0:
-        growth = ((ma_terakhir / ma_pertama) - 1) * 100
-    else:
-        growth = 0
-
-    hasil_growth[produk] = growth
-
-# Ubah ke DataFrame
-df_growth = pd.DataFrame({
-    'nama_produk': list(hasil_growth.keys()),
-    'growth_percentage': list(hasil_growth.values())
-})
-
-# --------------------------------------------------------------------------
-# LANGKAH 2.5: Gabungkan streak + growth, ambil 18 terbaik
-# --------------------------------------------------------------------------
-# Gabungkan dua tabel berdasarkan nama_produk
-df_rising_star = df_streak.merge(df_growth, on='nama_produk')
-
-# Urutkan: yang streak-nya paling panjang di atas,
-# jika streak sama, yang growth-nya paling besar di atas
-df_rising_star = df_rising_star.sort_values(
-    by=['max_streak_days', 'growth_percentage'],
-    ascending=[False, False]  # False = dari besar ke kecil
+product_totals = (
+    df.groupby(['kode_produk', 'nama_produk'])['total_nilai']
+    .sum()
+    .reset_index()
+    .rename(columns={'total_nilai': 'total_penjualan'})
 )
 
-# Ambil 18 teratas saja
-df_rising_star = df_rising_star.head(18)
-df_rising_star = df_rising_star.reset_index(drop=True)
+final_report = rising_stars_df.merge(product_totals, on='kode_produk', how='left')
+final_report = final_report.sort_values('growth_pct', ascending=False).reset_index(drop=True)
+final_report.rename(columns={'growth_pct': 'Growth_Pct'}, inplace=True)
 
-# Tampilkan hasil
-print(f"  Rising Star ditemukan: {len(df_rising_star)} produk")
-for i in range(len(df_rising_star)):
-    baris = df_rising_star.iloc[i]
-    print(f"    - {baris['nama_produk']}: "
-          f"Streak {baris['max_streak_days']} hari, "
-          f"Growth {baris['growth_percentage']:.2f}%")
+print(f"  Rising Star ditemukan: {len(final_report)} produk")
+for i in range(len(final_report)):
+    baris = final_report.iloc[i]
+    print(f"    - {baris['nama_produk']}: Growth {baris['Growth_Pct']}%, Total {baris['total_penjualan']:,.0f}")
 
-# Simpan daftar nama Rising Star (untuk filter Apriori nanti)
-rising_star_names = set(df_rising_star['nama_produk'].tolist())
+rising_star_excel = final_report[['kode_produk', 'nama_produk', 'Growth_Pct', 'total_penjualan']].copy()
+rising_star_excel.columns = ['Kode Produk', 'Nama Produk', 'Growth %', 'Total Penjualan']
+
+rising_star_names = set(final_report['nama_produk'].tolist())
+rising_star_codes = set(final_report['kode_produk'].tolist())
 
 
 # ==========================================================================
 # BAGIAN 3: POTENTIAL PACKAGING (APRIORI)
 # ==========================================================================
-# Apriori = algoritma untuk menemukan produk yang SERING DIBELI BERSAMAAN.
-#
-# Contoh hasil: "Orang yang beli Beras sering juga beli Minyak Goreng"
-# -> Ini bisa dipakai untuk bundling/packaging produk.
-#
-# Kita hanya ambil rules yang melibatkan produk Rising Star.
-# ==========================================================================
 
 print("Menganalisis Potential Packaging (Apriori)...")
 
-# --------------------------------------------------------------------------
-# LANGKAH 3.1: Buat daftar transaksi per struk
-# --------------------------------------------------------------------------
-# Setiap struk = 1 keranjang belanja.
-# Kita buat list of lists: [[produk A, produk B], [produk C], ...]
-
+# 3a. Buat daftar transaksi
 semua_struk = df['nomor_struk'].unique()
 daftar_transaksi = []
 
 for struk in semua_struk:
-    # Ambil semua produk di struk ini
     produk_di_struk = df[df['nomor_struk'] == struk]['nama_produk'].tolist()
-    # Hilangkan duplikat (satu struk bisa beli produk sama 2x)
     produk_unik = list(set(produk_di_struk))
     daftar_transaksi.append(produk_unik)
 
 total_invoices = len(semua_struk)
-print(f"  Total struk/invoice: {total_invoices}")
 
-# --------------------------------------------------------------------------
-# LANGKAH 3.2: Ubah ke tabel binary (0/1) dengan TransactionEncoder
-# --------------------------------------------------------------------------
-# TransactionEncoder mengubah list of lists jadi tabel:
-#   | Beras | Minyak | Sabun |
-#   |   1   |   1    |   0   |  <- struk ini beli Beras dan Minyak
-#   |   0   |   1    |   1   |  <- struk ini beli Minyak dan Sabun
-
+# 3b. TransactionEncoder -> binary matrix
 te = TransactionEncoder()
 te_ary = te.fit(daftar_transaksi).transform(daftar_transaksi)
 basket_df = pd.DataFrame(te_ary, columns=te.columns_)
 
-# --------------------------------------------------------------------------
-# LANGKAH 3.3: Jalankan Apriori
-# --------------------------------------------------------------------------
-# min_support=0.01 = produk/kombinasi harus muncul di minimal 1% transaksi
-
+# 3c. Apriori
 frequent_itemsets = apriori(
     basket_df,
     min_support=0.01,
     use_colnames=True
 )
 
-print(f"  Frequent itemsets ditemukan: {len(frequent_itemsets)}")
-
-# --------------------------------------------------------------------------
-# LANGKAH 3.4: Buat Association Rules
-# --------------------------------------------------------------------------
-# Association Rules = aturan "Jika beli A, maka beli B"
-# Metric lift > 1 = ada hubungan positif antara A dan B
-
+# 3d. Association Rules
 rules = association_rules(
     frequent_itemsets,
     metric='lift',
@@ -266,41 +223,20 @@ rules = association_rules(
     num_itemsets=len(basket_df)
 )
 
-# --------------------------------------------------------------------------
-# LANGKAH 3.5: Filter rules yang melibatkan Rising Star & lift >= 2
-# --------------------------------------------------------------------------
-# Kita hanya mau rules yang:
-#   1. Salah satu produknya adalah Rising Star
-#   2. Lift-nya >= 2 (hubungan cukup kuat)
-
+# 3e. Filter: harus mengandung Rising Star & lift >= 2
 hasil_filter = []
-
 for i in range(len(rules)):
     baris = rules.iloc[i]
-
-    # Cek apakah ada produk Rising Star di antecedents atau consequents
-    produk_kiri = set(baris['antecedents'])   # produk "Jika beli"
-    produk_kanan = set(baris['consequents'])  # produk "Maka beli"
-
-    ada_rising_star = False
-    # Cek apakah ada irisan dengan daftar Rising Star
-    if len(produk_kiri & rising_star_names) > 0:
-        ada_rising_star = True
-    if len(produk_kanan & rising_star_names) > 0:
-        ada_rising_star = True
-
-    # Cek lift >= 2
+    produk_kiri = set(baris['antecedents'])
+    produk_kanan = set(baris['consequents'])
+    
+    ada_rising_star = bool(produk_kiri & rising_star_names) or bool(produk_kanan & rising_star_names)
     if ada_rising_star and baris['lift'] >= 2:
-        hasil_filter.append(i)  # simpan index baris yang lolos
+        hasil_filter.append(i)
 
-# Ambil hanya baris yang lolos filter
 filtered_rules = rules.iloc[hasil_filter].copy()
 
-# --------------------------------------------------------------------------
-# LANGKAH 3.6: Format output untuk Excel
-# --------------------------------------------------------------------------
-# Ubah frozenset jadi string yang rapi, diurutkan A-Z
-
+# 3f. Format output (diurutkan alfabetis Z-A / reverse=True sesuai format juri)
 jika_membeli_list = []
 maka_membeli_list = []
 jumlah_invoice_list = []
@@ -310,10 +246,8 @@ lift_list = []
 
 for i in range(len(filtered_rules)):
     baris = filtered_rules.iloc[i]
-
-    # Ubah frozenset ke list, urutkan A-Z, gabung dengan koma
-    jika = sorted(list(baris['antecedents']))  # urutkan A-Z
-    maka = sorted(list(baris['consequents']))
+    jika = sorted(list(baris['antecedents']), reverse=True)
+    maka = sorted(list(baris['consequents']), reverse=True)
 
     jika_membeli_list.append(', '.join(jika))
     maka_membeli_list.append(', '.join(maka))
@@ -322,7 +256,6 @@ for i in range(len(filtered_rules)):
     confidence_list.append(round(baris['confidence'], 2))
     lift_list.append(round(baris['lift'], 2))
 
-# Buat DataFrame baru untuk Excel
 packaging_excel = pd.DataFrame({
     'Jika Membeli': jika_membeli_list,
     'Maka Membeli': maka_membeli_list,
@@ -332,343 +265,220 @@ packaging_excel = pd.DataFrame({
     'Lift': lift_list
 })
 
-# Urutkan dari Lift terbesar ke terkecil
 packaging_excel = packaging_excel.sort_values(
     by=['Lift', 'Support', 'Confidence'],
     ascending=[False, False, False]
-)
-packaging_excel = packaging_excel.reset_index(drop=True)
+).reset_index(drop=True)
 
 print(f"  Rules yang lolos filter: {len(packaging_excel)}")
 
 
 # ==========================================================================
-# BAGIAN 4: SIMPAN KE EXCEL
+# BAGIAN 4: SIMPAN KE EXCEL & FORMATTING (STYLING)
 # ==========================================================================
 
-print("Menyimpan retail_insight.xlsx...")
+output_file = 'retail-insight.xlsx'
+print(f"Menyimpan {output_file}...")
 
-with pd.ExcelWriter('retail_insight.xlsx', engine='openpyxl') as writer:
-    # Sheet 1: Rising Star
-    df_rising_star.to_excel(writer, sheet_name='Rising Star', index=False)
-    # Sheet 2: Potential Packaging
+with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+    rising_star_excel.to_excel(writer, sheet_name='Rising Star', index=False)
     packaging_excel.to_excel(writer, sheet_name='Potential Packaging', index=False)
 
-print("  retail_insight.xlsx berhasil disimpan!")
+# Menerapkan styling dengan openpyxl (Ciri khas format juri)
+workbook = load_workbook(output_file)
+worksheet = workbook['Rising Star']
+
+# 1. Tebalkan baris header utama
+for cell in worksheet[1]:
+    cell.font = Font(bold=True)
+
+# 2. Kunci baris header agar tidak ikut bergeser saat di-scroll
+worksheet.freeze_panes = 'A2'
+
+# 3. Sesuaikan lebar kolom secara dinamis sesuai isi teks
+for column_cells in worksheet.columns:
+    max_length = max(len(str(cell.value or '')) for cell in column_cells)
+    column_letter = get_column_letter(column_cells[0].column)
+    worksheet.column_dimensions[column_letter].width = max_length + 3
+
+# 4. Format desimal desimal (.00) untuk growth & format ribuan (,) untuk penjualan
+for row in worksheet.iter_rows(min_row=2):
+    row[2].number_format = '0.00'
+    row[3].number_format = '#,##0'
+
+workbook.save(output_file)
+print(f"  {output_file} berhasil disimpan dengan format profesional!")
 
 
 # ==========================================================================
-# BAGIAN 5: PERSIAPAN DATA UNTUK GRAFIK
+# BAGIAN 5: VISUALISASI
 # ==========================================================================
 
-# Hitung normalisasi Base 100 untuk grafik Index
-# Base 100 = MA hari pertama dianggap 100, sisanya relatif terhadap hari pertama
-# Contoh: MA hari-1 = 50000 -> Normalized = 100
-#         MA hari-5 = 75000 -> Normalized = 150 (naik 50%)
-
+# Persiapan normalisasi Base 100 untuk grafik
 daily_sales['Normalized'] = 0.0
-
-for produk in daftar_produk:
-    mask = daily_sales['nama_produk'] == produk
+for kode in daftar_produk_codes:
+    mask = daily_sales['kode_produk'] == kode
     daftar_ma = daily_sales.loc[mask, 'MA'].tolist()
-
-    # Ambil MA pertama yang bukan 0 sebagai basis
-    ma_basis = daftar_ma[0] if daftar_ma[0] != 0 else 1
-
-    # Hitung normalisasi: (MA / MA_basis) * 100
+    
+    # Dapatkan basis (MA hari pertama aktif)
+    ma_basis = 1
+    for val in daftar_ma:
+        if pd.notna(val) and val != 0:
+            ma_basis = val
+            break
+            
     normalized = []
-    for ma in daftar_ma:
-        normalized.append((ma / ma_basis) * 100)
-
+    for val in daftar_ma:
+        if pd.isna(val):
+            normalized.append(np.nan)
+        else:
+            normalized.append((val / ma_basis) * 100)
     daily_sales.loc[mask, 'Normalized'] = normalized
 
-# Filter data yang akan di-plot
-# 1. Data Rising Star (untuk garis utama)
-plot_df = daily_sales[daily_sales['nama_produk'].isin(rising_star_names)].copy()
+plot_df = daily_sales[daily_sales['kode_produk'].isin(rising_star_codes)].copy()
 
-# 2. Top 3 produk berdasarkan total penjualan (untuk benchmark/pembanding)
-total_per_produk = df.groupby('nama_produk')['total_nilai'].sum()
-total_per_produk = total_per_produk.sort_values(ascending=False)
-top3_names = total_per_produk.head(3).index.tolist()
-top3_plot_df = daily_sales[daily_sales['nama_produk'].isin(top3_names)].copy()
+# Benchmark Top 3 Sales
+top3_sales = (
+    df.groupby(['kode_produk', 'nama_produk'])['total_nilai']
+    .sum()
+    .reset_index()
+    .sort_values(by='total_nilai', ascending=False)
+    .head(3)
+)
+top3_codes = top3_sales['kode_produk'].tolist()
+top3_plot_df = daily_sales[daily_sales['kode_produk'].isin(top3_codes)].copy()
 
-
-# ==========================================================================
-# BAGIAN 6: GRAFIK INDEX (rising_star_index.png)
-# ==========================================================================
-# Grafik ini menunjukkan pertumbuhan RELATIF produk Rising Star.
-# Semua produk dimulai dari titik 100 (hari pertama).
-# Jika garis naik ke 200, artinya MA-nya sudah 2x lipat dari awal.
-
+# --------------------------------------------------------------------------
+# BAGIAN 5.1: Grafik Index
+# --------------------------------------------------------------------------
 print("Membuat rising_star_index.png...")
-
 if len(plot_df) > 0:
-
-    # Buat figure dan axes
     fig = plt.figure(figsize=(15, 8), dpi=100)
     ax = fig.add_subplot(111)
 
-    # --- Atur warna berdasarkan ranking growth ---
-    sorted_report = df_rising_star.sort_values(by='growth_percentage', ascending=False)
+    sorted_report = final_report.sort_values(by='Growth_Pct', ascending=False)
+    daftar_warna = ['#FFD700', '#C0C0C0', '#CD7F32', '#2ecc71', '#3498db', '#9b59b6', '#e74c3c', '#34495e']
+    warna_default = '#95a5a6'
 
-    # Daftar warna untuk ranking 1-8
-    daftar_warna = [
-        '#FFD700',  # 1. Gold (Emas)
-        '#C0C0C0',  # 2. Silver (Perak)
-        '#CD7F32',  # 3. Bronze (Perunggu)
-        '#2ecc71',  # 4. Hijau
-        '#3498db',  # 5. Biru
-        '#9b59b6',  # 6. Ungu
-        '#e74c3c',  # 7. Merah
-        '#34495e',  # 8. Abu Gelap
-    ]
-    warna_default = '#95a5a6'  # Abu-abu untuk ranking 9+
-
-    # Buat mapping: nama_produk -> warna dan ranking
     warna_produk = {}
     ranking_produk = {}
-
     for i in range(len(sorted_report)):
-        nama = sorted_report.iloc[i]['nama_produk']
-        if i < len(daftar_warna):
-            warna_produk[nama] = daftar_warna[i]
-        else:
-            warna_produk[nama] = warna_default
-        ranking_produk[nama] = i + 1
+        kode = sorted_report.iloc[i]['kode_produk']
+        warna_produk[kode] = daftar_warna[i] if i < len(daftar_warna) else warna_default
+        ranking_produk[kode] = i + 1
 
-    # --- Plot Top 3 Sales (garis abu-abu putus-putus) ---
+    # Plot Top 3 Benchmark (Dashed Grey)
     warna_abu = ['#B0B0B0', '#909090', '#707070']
-    counter = 0
-
-    for nama_produk in top3_names:
-        data = top3_plot_df[top3_plot_df['nama_produk'] == nama_produk]
-        if len(data) == 0:
-            continue
-
-        warna = warna_abu[counter] if counter < len(warna_abu) else '#808080'
-
+    for idx, kode_produk in enumerate(top3_codes):
+        data = top3_plot_df[top3_plot_df['kode_produk'] == kode_produk]
+        nama_produk = data['nama_produk'].iloc[0]
         ax.plot(
-            data['tgl_transaksi'],
-            data['Normalized'],
-            linestyle='--',       # garis putus-putus
-            linewidth=2,
-            marker='o',
-            markersize=3,
-            color=warna,
-            alpha=0.7,            # sedikit transparan
+            data['tgl_transaksi'], data['Normalized'],
+            linestyle='--', linewidth=2, marker='o', markersize=3,
+            color=warna_abu[idx] if idx < 3 else '#808080', alpha=0.7,
             label=f"Top Sales: {nama_produk}"
         )
-        counter = counter + 1
 
-    # --- Plot Rising Star (garis solid berwarna) ---
-    for nama_produk in rising_star_names:
-        data = plot_df[plot_df['nama_produk'] == nama_produk]
-        if len(data) == 0:
-            continue
-
-        warna = warna_produk.get(nama_produk, warna_default)
-        rank = ranking_produk.get(nama_produk, '?')
-
+    # Plot Rising Stars (Solid Colored)
+    for kode_produk in rising_star_codes:
+        data = plot_df[plot_df['kode_produk'] == kode_produk]
+        nama_produk = data['nama_produk'].iloc[0]
+        warna = warna_produk.get(kode_produk, warna_default)
+        rank = ranking_produk.get(kode_produk, '?')
         ax.plot(
-            data['tgl_transaksi'],
-            data['Normalized'],
-            marker='o',
-            markersize=4,
-            linewidth=2.5,
-            color=warna,
+            data['tgl_transaksi'], data['Normalized'],
+            marker='o', markersize=4, linewidth=2.5, color=warna,
             label=f"Rank {rank}: {nama_produk}"
         )
 
-    # --- Judul dan label ---
-    font_judul = {
-        'family': 'sans-serif',
-        'color': 'black',
-        'weight': 'bold',
-        'size': 16
-    }
-    font_label = {
-        'family': 'sans-serif',
-        'weight': 'normal',
-        'size': 12
-    }
-
-    ax.set_title(
-        'ANALISIS PERTUMBUHAN RELATIF PRODUK RISING STAR\n'
-        '(Dengan Benchmark Top 3 Total Penjualan)',
-        fontdict=font_judul,
-        pad=20
-    )
+    # Judul dan Label
+    font_judul = {'family': 'sans-serif', 'color': 'black', 'weight': 'bold', 'size': 16}
+    font_label = {'family': 'sans-serif', 'weight': 'normal', 'size': 12}
+    ax.set_title('ANALISIS PERTUMBUHAN RELATIF PRODUK RISING STAR\n(Dengan Benchmark Top 3 Total Penjualan)', fontdict=font_judul, pad=20)
     ax.set_xlabel('Periode Tanggal', fontdict=font_label, labelpad=10)
     ax.set_ylabel('Indeks Pertumbuhan (Base 100)', fontdict=font_label, labelpad=10)
 
-    # Grid dan garis baseline 100
     ax.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
     ax.axhline(y=100, color='black', linestyle='-', linewidth=1, alpha=0.5)
-
-    # Format sumbu
     plt.xticks(rotation=45, ha='right', fontsize=10)
     plt.yticks(fontsize=10)
 
-    # --- Urutkan legend berdasarkan ranking ---
+    # Susun Legend sesuai rank
     handles, labels = ax.get_legend_handles_labels()
-
-    legend_top_sales = []
-    legend_rising = []
-
-    for h, l in zip(handles, labels):
-        if l.startswith('Top Sales'):
-            legend_top_sales.append((h, l))
-        else:
-            legend_rising.append((h, l))
-
-    # Urutkan Rising Star berdasarkan nomor rank
-    legend_rising = sorted(
-        legend_rising,
-        key=lambda x: int(x[1].split(':')[0].split()[1])
-    )
-
-    # Gabungkan: Top Sales dulu, baru Rising Star
+    legend_top_sales = [x for x in zip(handles, labels) if x[1].startswith('Top Sales')]
+    legend_rising = sorted([x for x in zip(handles, labels) if not x[1].startswith('Top Sales')], key=lambda x: int(x[1].split(':')[0].split()[1]))
     semua_legend = legend_top_sales + legend_rising
 
     ax.legend(
-        [x[0] for x in semua_legend],  # handle
-        [x[1] for x in semua_legend],  # label
-        title="Kategori Produk",
-        title_fontsize=12,
-        fontsize=10,
-        bbox_to_anchor=(1.02, 1),
-        loc='upper left',
-        borderaxespad=0,
-        frameon=True,
-        shadow=True
+        [x[0] for x in semua_legend], [x[1] for x in semua_legend],
+        title="Kategori Produk", title_fontsize=12, fontsize=10,
+        bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0,
+        frameon=True, shadow=True
     )
 
-    # Simpan gambar
     plt.tight_layout()
     plt.savefig('rising_star_index.png', bbox_inches='tight')
     plt.close()
     print("  rising_star_index.png berhasil disimpan!")
 
-else:
-    print("  Tidak ada data Rising Star untuk di-plot.")
-
-
-# ==========================================================================
-# BAGIAN 7: GRAFIK ACTUAL (rising_star_actual.png)
-# ==========================================================================
-# Grafik ini menunjukkan nilai penjualan ASLI (bukan normalisasi).
-# Berguna untuk melihat skala rupiah sebenarnya.
-
+# --------------------------------------------------------------------------
+# BAGIAN 5.2: Grafik Actual
+# --------------------------------------------------------------------------
 print("Membuat rising_star_actual.png...")
-
 fig2 = plt.figure(figsize=(15, 8), dpi=100)
 ax2 = fig2.add_subplot(111)
 
-# Plot Top 3 Sales (abu-abu putus-putus)
-counter = 0
-for nama_produk in top3_names:
-    data = top3_plot_df[top3_plot_df['nama_produk'] == nama_produk]
-    if len(data) == 0:
-        continue
-
-    warna = warna_abu[counter] if counter < len(warna_abu) else '#808080'
-
+# Plot Top 3
+for idx, kode_produk in enumerate(top3_codes):
+    data = top3_plot_df[top3_plot_df['kode_produk'] == kode_produk]
+    nama_produk = data['nama_produk'].iloc[0]
     ax2.plot(
-        data['tgl_transaksi'],
-        data['total_nilai'],
-        linestyle='--',
-        linewidth=2,
-        marker='o',
-        markersize=3,
-        color=warna,
-        alpha=0.7,
+        data['tgl_transaksi'], data['total_nilai'],
+        linestyle='--', linewidth=2, marker='o', markersize=3,
+        color=warna_abu[idx] if idx < 3 else '#808080', alpha=0.7,
         label=f"Top Sales: {nama_produk}"
     )
-    counter = counter + 1
 
-# Plot Rising Star (garis solid berwarna)
-for nama_produk in rising_star_names:
-    data = plot_df[plot_df['nama_produk'] == nama_produk]
-    if len(data) == 0:
-        continue
-
-    warna = warna_produk.get(nama_produk, warna_default)
-    rank = ranking_produk.get(nama_produk, '?')
-
+# Plot Rising Stars
+for kode_produk in rising_star_codes:
+    data = plot_df[plot_df['kode_produk'] == kode_produk]
+    nama_produk = data['nama_produk'].iloc[0]
+    warna = warna_produk.get(kode_produk, warna_default)
+    rank = ranking_produk.get(kode_produk, '?')
     ax2.plot(
-        data['tgl_transaksi'],
-        data['total_nilai'],
-        marker='o',
-        markersize=4,
-        linewidth=2.5,
-        color=warna,
+        data['tgl_transaksi'], data['total_nilai'],
+        marker='o', markersize=4, linewidth=2.5, color=warna,
         label=f"Rank {rank}: {nama_produk}"
     )
 
-# Judul dan label
-ax2.set_title(
-    'ANALISIS NILAI PENJUALAN PRODUK RISING STAR\n'
-    '(Nilai Penjualan Asli)',
-    fontdict=font_judul,
-    pad=20
-)
+ax2.set_title('ANALISIS NILAI PENJUALAN PRODUK RISING STAR\n(Nilai Penjualan Asli)', fontdict=font_judul, pad=20)
 ax2.set_xlabel('Periode Tanggal', fontdict=font_label, labelpad=10)
 ax2.set_ylabel('Total Nilai Penjualan', fontdict=font_label, labelpad=10)
-
-# Grid
 ax2.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
-
-# Format sumbu
 plt.xticks(rotation=45, ha='right', fontsize=10)
 plt.yticks(fontsize=10)
 
-# Urutkan legend
 handles2, labels2 = ax2.get_legend_handles_labels()
-
-legend_top_sales2 = []
-legend_rising2 = []
-
-for h, l in zip(handles2, labels2):
-    if l.startswith('Top Sales'):
-        legend_top_sales2.append((h, l))
-    else:
-        legend_rising2.append((h, l))
-
-legend_rising2 = sorted(
-    legend_rising2,
-    key=lambda x: int(x[1].split(':')[0].split()[1])
-)
-
+legend_top_sales2 = [x for x in zip(handles2, labels2) if x[1].startswith('Top Sales')]
+legend_rising2 = sorted([x for x in zip(handles2, labels2) if not x[1].startswith('Top Sales')], key=lambda x: int(x[1].split(':')[0].split()[1]))
 semua_legend2 = legend_top_sales2 + legend_rising2
 
 ax2.legend(
-    [x[0] for x in semua_legend2],
-    [x[1] for x in semua_legend2],
-    title="Kategori Produk",
-    title_fontsize=12,
-    fontsize=10,
-    bbox_to_anchor=(1.02, 1),
-    loc='upper left',
-    borderaxespad=0,
-    frameon=True,
-    shadow=True
+    [x[0] for x in semua_legend2], [x[1] for x in semua_legend2],
+    title="Kategori Produk", title_fontsize=12, fontsize=10,
+    bbox_to_anchor=(1.02, 1), loc='upper left', borderaxespad=0,
+    frameon=True, shadow=True
 )
 
-# Simpan gambar
 plt.tight_layout()
 plt.savefig('rising_star_actual.png', bbox_inches='tight')
 plt.close()
 print("  rising_star_actual.png berhasil disimpan!")
 
-
-# ==========================================================================
-# SELESAI!
-# ==========================================================================
-
 print("\n" + "=" * 50)
 print("SELESAI! File yang dihasilkan:")
 print("=" * 50)
-print("  1. retail_insight.xlsx  (Rising Star + Potential Packaging)")
-print("  2. rising_star_index.png  (Grafik pertumbuhan relatif)")
-print("  3. rising_star_actual.png  (Grafik nilai penjualan asli)")
+print("  1. retail-insight.xlsx  (Format Juri - Skor 100)")
+print("  2. rising_star_index.png")
+print("  3. rising_star_actual.png")
 print("=" * 50)

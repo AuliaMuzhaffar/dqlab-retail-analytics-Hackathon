@@ -9,10 +9,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mlxtend.frequent_patterns import apriori, association_rules
 from mlxtend.preprocessing import TransactionEncoder
-from openpyxl import load_workbook
-from openpyxl.styles import Font
-from openpyxl.utils import get_column_letter
-import os
 
 # ============================================================
 # 1. DATA LOADING
@@ -44,57 +40,43 @@ daily_sales['MA'] = (
 
 # 2c. Identifikasi tren naik berturut-turut
 def find_longest_rising(group):
-    """
-    Temukan semua streak MA naik berturut-turut >= 12 hari,
-    lalu pilih streak dengan Growth % tertinggi.
-    """
+    """Temukan streak terpanjang MA naik berturut-turut."""
     group = group.sort_values('tgl_transaksi').reset_index(drop=True)
     ma = group['MA'].values
 
     # Cari semua streak
-    streaks = []
+    max_streak = 0
     current_streak = 0
+    max_end = -1
 
     for i in range(1, len(ma)):
         if pd.notna(ma[i]) and pd.notna(ma[i-1]) and ma[i] > ma[i-1]:
             current_streak += 1
+            if current_streak > max_streak:
+                max_streak = current_streak
+                max_end = i
         else:
-            if current_streak >= 12:
-                streaks.append({
-                    'streak': current_streak,
-                    'start_idx': i - current_streak,
-                    'end_idx': i - 1
-                })
             current_streak = 0
 
-    # Cek jika baris terakhir masih dalam streak
-    if current_streak >= 12:
-        streaks.append({
-            'streak': current_streak,
-            'start_idx': len(ma) - current_streak,
-            'end_idx': len(ma) - 1
-        })
-
-    if not streaks:
+    if max_streak < 12:
         return None
 
-    # Cari streak dengan Growth % tertinggi (sesuai logika juri)
-    best_streak = None
-    max_growth_pct = -float('inf')
+    # Growth: dari MA hari pertama naik ke MA hari terakhir naik
+    # Streak of N means transitions at indices (max_end-N+1) to max_end
+    # First rising day = max_end - max_streak + 1
+    # Last rising day = max_end
+    first_rise_idx = max_end - max_streak + 1
+    end_idx = max_end
 
-    for s in streaks:
-        ma_start = ma[s['start_idx']]
-        ma_end = ma[s['end_idx']]
-        growth_pct = ((ma_end - ma_start) / ma_start) * 100
-        if growth_pct > max_growth_pct:
-            max_growth_pct = growth_pct
-            best_streak = {
-                'kode_produk': group['kode_produk'].iloc[0],
-                'max_consecutive_days': s['streak'],
-                'growth_pct': round(growth_pct, 2)
-            }
+    ma_start = ma[first_rise_idx]
+    ma_end = ma[end_idx]
+    growth_pct = ((ma_end - ma_start) / ma_start) * 100
 
-    return best_streak
+    return {
+        'kode_produk': group['kode_produk'].iloc[0],
+        'max_consecutive_days': max_streak,
+        'growth_pct': round(growth_pct, 2)
+    }
 
 rising_results = []
 for kode, group in daily_sales.groupby('kode_produk'):
@@ -172,7 +154,7 @@ filtered_rules = rules[
     rules.apply(has_rising_star, axis=1) & (rules['lift'] >= 2)
 ].copy()
 
-# 3f. Format output (reverse=True pada sorted nama produk sesuai format juri)
+# 3f. Format output
 packaging_excel = pd.DataFrame({
     'Jika Membeli': filtered_rules['antecedents'].apply(lambda x: ', '.join(sorted(x, reverse=True))),
     'Maka Membeli': filtered_rules['consequents'].apply(lambda x: ', '.join(sorted(x, reverse=True))),
@@ -193,51 +175,20 @@ print(f"  Rules ditemukan: {len(packaging_excel)}")
 # 4. EXCEL OUTPUT
 # ============================================================
 
-output_file = 'retail-insight.xlsx'
-print(f"Menyimpan {output_file}...")
+print("Menyimpan retail_insight.xlsx...")
 
-with pd.ExcelWriter(output_file, engine='openpyxl') as writer:
+with pd.ExcelWriter('retail_insight.xlsx', engine='openpyxl') as writer:
     rising_star_excel.to_excel(writer, sheet_name='Rising Star', index=False)
     packaging_excel.to_excel(writer, sheet_name='Potential Packaging', index=False)
 
-# ============================================================
-# 4b. EXCEL FORMATTING (STYLING OPENPYXL)
-# ============================================================
-workbook = load_workbook(output_file)
-worksheet = workbook['Rising Star']
-
-# Bold header
-for cell in worksheet[1]:
-    cell.font = Font(bold=True)
-
-# Freeze pane
-worksheet.freeze_panes = 'A2'
-
-# Auto width
-for column_cells in worksheet.columns:
-    max_length = 0
-    column_letter = get_column_letter(column_cells[0].column)
-    for cell in column_cells:
-        try:
-            if len(str(cell.value)) > max_length:
-                max_length = len(str(cell.value))
-        except:
-            pass
-    worksheet.column_dimensions[column_letter].width = max_length + 3
-
-# Format numerik
-for row in worksheet.iter_rows(min_row=2):
-    # Growth %
-    row[2].number_format = '0.00'
-    # Total Penjualan
-    row[3].number_format = '#,##0'
-
-workbook.save(output_file)
-print(f"  {output_file} berhasil disimpan dengan format profesional.")
+print("  retail_insight.xlsx berhasil disimpan.")
 
 # ============================================================
 # 5. PERSIAPAN DATA VISUALISASI
 # ============================================================
+
+# Gunakan HANYA tanggal dengan transaksi aktual (tanpa zero-fill)
+# Ini menghasilkan garis smooth yang sesuai referensi
 
 # Normalisasi Base 100 (berdasarkan MA dari hari aktif)
 daily_sales['Normalized'] = daily_sales.groupby('kode_produk')['MA'].transform(
@@ -515,6 +466,6 @@ print("  rising_star_actual.png berhasil disimpan.")
 # ============================================================
 
 print("\nSelesai! File output yang dihasilkan:")
-print(f"  1. {output_file}")
+print("  1. retail_insight.xlsx")
 print("  2. rising_star_index.png")
 print("  3. rising_star_actual.png")
