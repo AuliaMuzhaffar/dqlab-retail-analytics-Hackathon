@@ -1,0 +1,9 @@
+# Ignore backups and temporary files
+.DS_Store
+__pycache__/
+*.zip
+
+# Ignore duplicate solution files
+solusi-retail (2).py
+solusi-retail copy.py
+solusi-retail (juri).py
